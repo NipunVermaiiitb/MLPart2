@@ -1,0 +1,258 @@
+import pandas as pd
+import numpy as np
+import sklearn
+from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.preprocessing import OneHotEncoder, StandardScaler, FunctionTransformer
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import f1_score, roc_auc_score, confusion_matrix
+from sklearn.svm import SVC   # <-- SVM added here
+
+# ======================================================
+# 1) Load TRAIN and TEST
+# ======================================================
+
+train_path = "/kaggle/input/start-up-founder-retention-prediction/train.csv"
+test_path  = "/kaggle/input/start-up-founder-retention-prediction/test.csv"
+
+df = pd.read_csv(train_path)
+df_ext_test = pd.read_csv(test_path)
+
+# ======================================================
+# 2) Column Groups
+# ======================================================
+
+numeric_cols = [
+    "founder_id",
+    "founder_age",
+    "years_with_startup",
+    "monthly_revenue_generated",
+    "funding_rounds_led",
+    "distance_from_investor_hub",
+    "num_dependents"
+]
+
+ordinal_cols = [
+    "founder_visibility",
+    "startup_reputation",
+    "team_size_category",
+    "startup_stage",
+    "startup_performance_rating",
+    "venture_satisfaction",
+    "work_life_balance_rating"
+]
+
+categorical_cols = [
+    "founder_gender",
+    "founder_role",
+    "education_background",
+    "personal_status",
+    "innovation_support"
+]
+
+boolean_cols = [
+    "working_overtime",
+    "remote_operations",
+    "leadership_scope"
+]
+
+target_col = "retention_status"
+
+# ======================================================
+# 3) Normalize Boolean Columns
+# ======================================================
+
+def normalize_boolean(col):
+    return (
+        col.astype(str)
+           .str.strip()
+           .str.lower()
+           .map({"true":1, "false":0, "yes":1, "no":0, "1":1, "0":0})
+           .astype("Int64")
+    )
+
+for col in boolean_cols:
+    df[col] = normalize_boolean(df[col])
+    df_ext_test[col] = normalize_boolean(df_ext_test[col])
+
+# ======================================================
+# 4) Ordinal Encoding Based on Provided Orders
+# ======================================================
+
+ordinal_mappings = {
+    "founder_visibility": {
+        "low": 0, "medium": 1, "high": 2, "very high": 3
+    },
+    "startup_reputation": {
+        "poor": 0, "fair": 1, "good": 2, "excellent": 3
+    },
+    "team_size_category": {
+        "small": 0, "medium": 1, "large": 2
+    },
+    "startup_stage": {
+        "entry": 0, "mid": 1, "senior": 2
+    },
+    "startup_performance_rating": {
+        "below average": 1, "low": 0, "average": 2, "high": 3
+    },
+    "venture_satisfaction": {
+        "low": 0, "medium": 1, "high": 2, "very high": 3
+    },
+    "work_life_balance_rating": {
+        "fair": 0, "good": 1, "excellent": 2
+    }
+}
+
+def apply_ordinal(df, col, mapping):
+    df[col] = (
+        df[col].astype(str).str.strip().str.lower().map(mapping)
+    )
+
+for col in ordinal_cols:
+    apply_ordinal(df, col, ordinal_mappings[col])
+    apply_ordinal(df_ext_test, col, ordinal_mappings[col])
+
+# ======================================================
+# 5) Convert Target
+# ======================================================
+
+df[target_col] = df[target_col].map({"Stayed": 1, "Left": 0})
+
+# ======================================================
+# 6) Split Train/Validation
+# ======================================================
+
+X = df.drop(columns=[target_col])
+y = df[target_col]
+
+X_train, X_val, y_train, y_val = train_test_split(
+    X, y, test_size=0.20, random_state=42, stratify=y
+)
+
+# ======================================================
+# 7) Preprocessing Pipelines
+# ======================================================
+
+skewed_numeric_cols = ["monthly_revenue_generated", "distance_from_investor_hub"]
+skewed_numeric_cols = [c for c in skewed_numeric_cols if c in numeric_cols]
+
+skew_indices = [numeric_cols.index(c) for c in skewed_numeric_cols]
+
+def log_transform_selected(X):
+    X = X.copy().astype(float)
+    for idx in skew_indices:
+        X[:, idx] = np.log1p(np.clip(X[:, idx], 0, None))
+    return X
+
+numeric_pipeline = Pipeline([
+    ("impute", SimpleImputer(strategy="median")),
+    ("log", FunctionTransformer(log_transform_selected, validate=False)),
+    ("scale", StandardScaler())
+])
+
+def make_ohe():
+    if sklearn.__version__ >= "1.2":
+        return OneHotEncoder(handle_unknown="ignore", sparse_output=False)
+    return OneHotEncoder(handle_unknown="ignore", sparse=False)
+
+categorical_pipeline = Pipeline([
+    ("impute", SimpleImputer(strategy="most_frequent")),
+    ("ohe", make_ohe())
+])
+
+boolean_pipeline = Pipeline([
+    ("impute", SimpleImputer(strategy="most_frequent"))
+])
+
+ordinal_pipeline = Pipeline([
+    ("impute", SimpleImputer(strategy="most_frequent")),
+    ("scale", StandardScaler())
+])
+
+preprocessor = ColumnTransformer([
+    ("num", numeric_pipeline, numeric_cols),
+    ("ord", ordinal_pipeline, ordinal_cols),
+    ("cat", categorical_pipeline, categorical_cols),
+    ("bool", boolean_pipeline, boolean_cols)
+])
+
+
+# ======================================================
+# 8) SVM Model (instead of XGBoost)
+# ======================================================
+
+svm = SVC(
+    kernel="rbf",
+    C=1.5,
+    gamma="scale",
+    probability=True,   # required for predict_proba & AUC
+    random_state=42
+)
+
+clf = Pipeline([
+    ("preprocess", preprocessor),
+    ("model", svm)
+])
+
+clf.fit(X_train, y_train)
+
+# ======================================================
+# 9) K-Fold Evaluation
+# ======================================================
+
+skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+fold_f1, fold_auc = [], []
+combined_cm = np.zeros((2,2), dtype=int)
+
+X_val_df = X_val.reset_index(drop=True)
+y_val_arr = y_val.reset_index(drop=True).to_numpy()
+
+for fold, (_, idx) in enumerate(skf.split(X_val_df, y_val_arr), 1):
+    X_fold = X_val_df.iloc[idx]
+    y_fold = y_val_arr[idx]
+
+    y_pred = clf.predict(X_fold)
+    y_prob = clf.predict_proba(X_fold)[:, 1]
+
+    f1 = f1_score(y_fold, y_pred)
+    auc = roc_auc_score(y_fold, y_prob)
+    cm = confusion_matrix(y_fold, y_pred)
+
+    fold_f1.append(f1)
+    fold_auc.append(auc)
+    combined_cm += cm
+
+    print(f"\nFold {fold} - F1={f1:.4f}, AUC={auc:.4f}")
+    print(cm)
+
+print("\nAverage F1:", np.mean(fold_f1))
+print("Average AUC:", np.mean(fold_auc))
+print("Combined Confusion Matrix:\n", combined_cm)
+
+# ======================================================
+# 10) Retrain on FULL Training Set
+# ======================================================
+
+clf_full = Pipeline([
+    ("preprocess", preprocessor),
+    ("model", svm)
+])
+
+clf_full.fit(X, y)
+
+# ======================================================
+# 11) Predict on External Test
+# ======================================================
+
+ext_pred = clf_full.predict(df_ext_test)
+ext_pred_label = np.where(ext_pred == 1, "Stayed", "Left")
+
+submission = pd.DataFrame({
+    "founder_id": df_ext_test["founder_id"],
+    "retention_status": ext_pred_label
+})
+
+submission.to_csv("submission.csv", index=False)
+print("\nsubmission.csv ready!")
+print(submission.head())
