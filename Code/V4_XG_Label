@@ -54,7 +54,7 @@ categorical_cols = [
 boolean_cols = [
     "working_overtime",
     "remote_operations",
-    "leaderhip_scope"
+    "leadership_scope"
 ]
 
 target_col = "retention_status"
